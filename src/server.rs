@@ -175,6 +175,7 @@ impl ApiError {
                 | SqlValidationError::StatementCount(_) => "invalid_sql",
                 SqlValidationError::NotReadOnly(_) => "query_not_read_only",
                 SqlValidationError::SourceFunctionNotAllowed(_) => "query_source_function_not_allowed",
+                SqlValidationError::SourceRelationNotAllowed(_) => "query_source_relation_not_allowed",
             };
             return Self::new(StatusCode::BAD_REQUEST, code, validation.to_string());
         }

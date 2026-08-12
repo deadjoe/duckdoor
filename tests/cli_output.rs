@@ -36,6 +36,19 @@ fn seed_backends(home: &Path, port: u16, backends: &[(&str, &Path, bool)]) {
     fs::write(home.join("config.toml"), config).unwrap();
 }
 
+fn assert_query_error(home: &Path, sql: &str, expected_code: &str) -> Value {
+    let output = duckdoor()
+        .args(["--home", home.to_str().unwrap(), "query", sql])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["error"]["code"], expected_code);
+    assert_eq!(value["error"]["details"]["http_status"], 400);
+    value
+}
+
 struct DaemonGuard {
     home: PathBuf,
 }
@@ -520,35 +533,21 @@ fn query_cli_preserves_specific_http_error_codes() {
         home: home.path().to_path_buf(),
     };
 
-    let output = duckdoor()
-        .args([
-            "--home",
-            home.path().to_str().unwrap(),
-            "query",
-            "DELETE FROM anything WHERE 1 = 0",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(value["error"]["code"], "query_not_read_only");
-    assert_eq!(value["error"]["details"]["http_status"], 400);
-
-    let output = duckdoor()
-        .args([
-            "--home",
-            home.path().to_str().unwrap(),
-            "query",
-            "SELECT * FROM sqlite_query('app', 'SELECT 1')",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(value["error"]["code"], "query_source_function_not_allowed");
-    assert_eq!(value["error"]["details"]["http_status"], 400);
+    assert_query_error(
+        home.path(),
+        "DELETE FROM anything WHERE 1 = 0",
+        "query_not_read_only",
+    );
+    assert_query_error(
+        home.path(),
+        "SELECT * FROM sqlite_query('app', 'SELECT 1')",
+        "query_source_function_not_allowed",
+    );
+    assert_query_error(
+        home.path(),
+        "SELECT * FROM '/tmp/data.parquet'",
+        "query_source_relation_not_allowed",
+    );
 
     let healthy = duckdoor()
         .args([
@@ -570,14 +569,13 @@ fn query_cli_preserves_specific_http_error_codes() {
             "query_execution_failed",
         ),
     ] {
-        let output = duckdoor()
-            .args(["--home", home.path().to_str().unwrap(), "query", sql])
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(1));
-        let value: Value = serde_json::from_slice(&output.stderr).unwrap();
-        assert_eq!(value["error"]["code"], expected_code);
-        assert_eq!(value["error"]["details"]["http_status"], 400);
+        let value = assert_query_error(home.path(), sql, expected_code);
+        assert!(
+            !value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown error code")
+        );
     }
 
     let client = reqwest::blocking::Client::new();

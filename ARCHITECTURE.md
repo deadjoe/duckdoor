@@ -347,7 +347,12 @@ Read-only behavior is enforced in layers:
    rejected.
 2. The parsed AST rejects direct source-opening and SQL pass-through functions,
    including `sqlite_query`, `sqlite_scan`, `read_*`, `*_scan`, and dynamic
-   `query`. Clients use only registered relations and managed logical views.
+   `query`. It also rejects single-quoted, path-shaped, URL-shaped, glob-shaped,
+   and external-file-shaped table names so DuckDB replacement scans cannot open
+   a source by filename. Each worker enumerates its actual catalog relations
+   after initialization, so even file-shaped names are allowed only when that
+   exact relation exists; sharing a prefix with a backend name is insufficient.
+   Clients use only registered relations and managed logical views.
 3. SQLite and DuckDB files are attached with `READ_ONLY`.
 4. Parquet files are exposed only through read operations.
 5. Each DuckDB connection restricts allowed paths to the exact resolved source
@@ -380,7 +385,10 @@ The server limits request bodies to 1 MiB. Application-level failures use
 structured errors for invalid JSON, unknown routes, unsupported methods, SQL
 policy failures, engine errors, engine timeouts, saturation, and reload
 rejection. Query execution errors are separate from syntax/policy errors so
-callers can react without parsing prose. Outer timeout and panic middleware are
+callers can react without parsing prose. DuckDB's redundant low-level
+`Error code ...: Unknown error code` source-chain suffix is removed while the
+actual parser, binder, catalog, permission, or execution message is retained.
+Outer timeout and panic middleware are
 last-resort safeguards and can return an HTTP status before application-level
 JSON error mapping runs.
 

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt, fs,
     path::{Path, PathBuf},
     sync::{
@@ -21,7 +22,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     config::{Backend, BackendType, Config, LogicalView, MissingSourcePolicy, Paths, ViewMode, load_config},
-    sql::validate_read_only,
+    sql::validate_read_only_with_relations,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +105,11 @@ enum WorkerMessage {
     Stop,
 }
 
+struct WorkerReady {
+    interrupt: Arc<InterruptHandle>,
+    relations: HashSet<String>,
+}
+
 pub struct QueryPool {
     senders: Vec<mpsc::SyncSender<WorkerMessage>>,
     interrupts: Vec<Arc<InterruptHandle>>,
@@ -111,6 +117,7 @@ pub struct QueryPool {
     workers: usize,
     enabled_backends: usize,
     view_statuses: Vec<ViewStatus>,
+    allowed_relations: HashSet<String>,
     timeout: std::time::Duration,
 }
 
@@ -158,9 +165,13 @@ impl QueryPool {
             started.push(ready_rx);
         }
         let mut interrupts = Vec::with_capacity(config.workers);
+        let mut allowed_relations = HashSet::new();
         for ready in started {
             match ready.recv().context("query worker exited during startup")? {
-                Ok(interrupt) => interrupts.push(interrupt),
+                Ok(worker) => {
+                    interrupts.push(worker.interrupt);
+                    allowed_relations.extend(worker.relations);
+                }
                 Err(error) => {
                     for sender in &senders {
                         let _ = sender.send(WorkerMessage::Stop);
@@ -176,12 +187,13 @@ impl QueryPool {
             workers: config.workers,
             enabled_backends: config.backends.iter().filter(|backend| backend.enabled).count(),
             view_statuses: views.into_iter().map(|view| view.status).collect(),
+            allowed_relations,
             timeout: std::time::Duration::from_secs(config.request_timeout_seconds),
         })
     }
 
     pub async fn query(&self, sql: String) -> Result<QueryResult> {
-        validate_read_only(&sql)?;
+        validate_read_only_with_relations(&sql, &self.allowed_relations)?;
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
         let (response_tx, response_rx) = oneshot::channel();
         let mut message = WorkerMessage::Query {
@@ -345,33 +357,76 @@ pub fn inspect_view(config: &Config, view: &LogicalView) -> Result<(ViewStatus, 
 
 fn worker_main(
     receiver: &mpsc::Receiver<WorkerMessage>,
-    ready: &mpsc::SyncSender<Result<Arc<InterruptHandle>, String>>,
+    ready: &mpsc::SyncSender<Result<WorkerReady, String>>,
     backends: &[ResolvedBackend],
     views: &[CompiledView],
     init_sql: &str,
     max_rows: usize,
     threads_per_worker: usize,
 ) {
-    let connection = initialize_connection(backends, views, init_sql, threads_per_worker);
+    let connection =
+        initialize_connection(backends, views, init_sql, threads_per_worker).and_then(|connection| {
+            let relations = registered_relations(&connection)?;
+            Ok((connection, relations))
+        });
     let connection = match connection {
-        Ok(connection) => {
-            let _ = ready.send(Ok(connection.interrupt_handle()));
+        Ok((connection, relations)) => {
+            let _ = ready.send(Ok(WorkerReady {
+                interrupt: connection.interrupt_handle(),
+                relations,
+            }));
             connection
         }
         Err(error) => {
-            let _ = ready.send(Err(format!("{error:#}")));
+            let _ = ready.send(Err(format_query_error(&error)));
             return;
         }
     };
     while let Ok(message) = receiver.recv() {
         match message {
             WorkerMessage::Query { sql, response } => {
-                let result = run_query(&connection, &sql, max_rows).map_err(|error| format!("{error:#}"));
+                let result =
+                    run_query(&connection, &sql, max_rows).map_err(|error| format_query_error(&error));
                 let _ = response.send(result);
             }
             WorkerMessage::Stop => break,
         }
     }
+}
+
+fn registered_relations(connection: &Connection) -> Result<HashSet<String>> {
+    let mut statement = connection
+        .prepare("SELECT table_catalog, table_schema, table_name FROM information_schema.tables")?;
+    let mut rows = statement.query([])?;
+    let mut relations = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let catalog = row.get::<_, String>(0)?.to_ascii_lowercase();
+        let schema = row.get::<_, String>(1)?.to_ascii_lowercase();
+        let table = row.get::<_, String>(2)?.to_ascii_lowercase();
+        relations.insert(format!("{catalog}.{schema}.{table}"));
+        if schema == "main" {
+            relations.insert(format!("{catalog}.{table}"));
+        }
+        if catalog == "memory" {
+            relations.insert(format!("{schema}.{table}"));
+        }
+    }
+    Ok(relations)
+}
+
+fn format_query_error(error: &anyhow::Error) -> String {
+    let mut message = format!("{error:#}");
+    while let Some(prefix) = message.strip_suffix(": Unknown error code") {
+        let Some((clean, code)) = prefix.rsplit_once(": Error code ") else {
+            break;
+        };
+        let digits = code.strip_prefix('-').unwrap_or(code);
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            break;
+        }
+        message.truncate(clean.len());
+    }
+    message
 }
 
 fn initialize_connection(
@@ -946,7 +1001,7 @@ mod tests {
                     name: "archive".into(),
                     kind: BackendType::Parquet,
                     path: parquet_path,
-                    relation: Some("archive_tracks".into()),
+                    relation: Some("parquet".into()),
                     enabled: true,
                 },
             ],
@@ -975,7 +1030,7 @@ mod tests {
                     },
                     ViewInput {
                         backend: "archive".into(),
-                        relation: "archive_tracks".into(),
+                        relation: "parquet".into(),
                         columns: BTreeMap::from([
                             ("isrc".into(), "recording_id".into()),
                             ("track_name".into(), "name".into()),
@@ -988,6 +1043,13 @@ mod tests {
         };
         let pool = QueryPool::new(&config, "").unwrap();
         assert_eq!(pool.stats().active_views, 1);
+        assert!(pool.allowed_relations.contains("archive.parquet"));
+        assert!(!pool.allowed_relations.contains("archive.other.parquet"));
+        let parquet_result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(pool.query("SELECT count(*) FROM archive.parquet".into()))
+            .unwrap();
+        assert_eq!(parquet_result.rows[0][0], json!(1));
         let result = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(pool.query(
@@ -1040,5 +1102,19 @@ mod tests {
         let pool = QueryPool::new(&config, "").unwrap();
         assert_eq!(pool.stats().unavailable_views, 1);
         assert_eq!(pool.view_statuses()[0].skipped_sources[0].reason, "disabled");
+    }
+
+    #[test]
+    fn query_error_format_removes_only_the_duckdb_ffi_placeholder() {
+        let error = anyhow::anyhow!("Error code 1: Unknown error code")
+            .context("Catalog Error: table does not exist");
+        assert_eq!(format_query_error(&error), "Catalog Error: table does not exist");
+
+        let meaningful = anyhow::anyhow!("Error code 42: real engine detail")
+            .context("Catalog Error: table does not exist");
+        assert_eq!(
+            format_query_error(&meaningful),
+            "Catalog Error: table does not exist: Error code 42: real engine detail"
+        );
     }
 }
