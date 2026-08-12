@@ -169,6 +169,9 @@ fn validate_config(config: &mut Config) -> Result<()> {
     if config.max_rows == 0 {
         bail!("max_rows must be greater than zero");
     }
+    if config.request_timeout_seconds == 0 {
+        bail!("request_timeout_seconds must be greater than zero");
+    }
     config.backends.sort_by(|a, b| a.name.cmp(&b.name));
     for (index, backend) in config.backends.iter().enumerate() {
         validate_name(&backend.name)?;

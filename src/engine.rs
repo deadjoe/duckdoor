@@ -9,10 +9,10 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use base64::Engine as _;
-use duckdb::{Connection, types::Value};
+use duckdb::{Connection, InterruptHandle, types::Value};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value as JsonValue, json};
 use sqlparser::{ast::Statement, dialect::DuckDbDialect, parser::Parser};
@@ -49,9 +49,11 @@ enum WorkerMessage {
 
 pub struct QueryPool {
     senders: Vec<mpsc::SyncSender<WorkerMessage>>,
+    interrupts: Vec<Arc<InterruptHandle>>,
     next: AtomicUsize,
     workers: usize,
     enabled_backends: usize,
+    timeout: std::time::Duration,
 }
 
 impl QueryPool {
@@ -63,7 +65,7 @@ impl QueryPool {
         let mut senders = Vec::with_capacity(config.workers);
         let mut started = Vec::with_capacity(config.workers);
         for worker_id in 0..config.workers {
-            let (sender, receiver) = mpsc::sync_channel(32);
+            let (sender, receiver) = mpsc::sync_channel(0);
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let backends = config
                 .backends
@@ -90,9 +92,10 @@ impl QueryPool {
             senders.push(sender);
             started.push(ready_rx);
         }
+        let mut interrupts = Vec::with_capacity(config.workers);
         for ready in started {
             match ready.recv().context("query worker exited during startup")? {
-                Ok(()) => {}
+                Ok(interrupt) => interrupts.push(interrupt),
                 Err(error) => {
                     for sender in &senders {
                         let _ = sender.send(WorkerMessage::Stop);
@@ -103,26 +106,46 @@ impl QueryPool {
         }
         Ok(Self {
             senders,
+            interrupts,
             next: AtomicUsize::new(0),
             workers: config.workers,
             enabled_backends: config.backends.iter().filter(|backend| backend.enabled).count(),
+            timeout: std::time::Duration::from_secs(config.request_timeout_seconds),
         })
     }
 
     pub async fn query(&self, sql: String) -> Result<QueryResult> {
         validate_read_only(&sql)?;
-        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
         let (response_tx, response_rx) = oneshot::channel();
-        self.senders[index]
-            .try_send(WorkerMessage::Query {
-                sql,
-                response: response_tx,
-            })
-            .map_err(|error| anyhow!("query queue is full or unavailable: {error}"))?;
-        response_rx
-            .await
-            .context("query worker stopped unexpectedly")?
-            .map_err(anyhow::Error::msg)
+        let mut message = WorkerMessage::Query {
+            sql,
+            response: response_tx,
+        };
+        let mut selected = None;
+        for offset in 0..self.senders.len() {
+            let index = (start + offset) % self.senders.len();
+            match self.senders[index].try_send(message) {
+                Ok(()) => {
+                    selected = Some(index);
+                    break;
+                }
+                Err(mpsc::TrySendError::Full(returned) | mpsc::TrySendError::Disconnected(returned)) => {
+                    message = returned;
+                }
+            }
+        }
+        let index = selected.context("all query workers are busy or unavailable")?;
+        let mut interrupt_guard = InterruptOnDrop::new(Arc::clone(&self.interrupts[index]));
+        match tokio::time::timeout(self.timeout, response_rx).await {
+            Ok(response) => {
+                interrupt_guard.disarm();
+                response
+                    .context("query worker stopped unexpectedly")?
+                    .map_err(anyhow::Error::msg)
+            }
+            Err(_) => bail!("query exceeded the {} second timeout", self.timeout.as_secs()),
+        }
     }
 
     pub fn workers(&self) -> usize {
@@ -130,6 +153,29 @@ impl QueryPool {
     }
     pub fn enabled_backends(&self) -> usize {
         self.enabled_backends
+    }
+}
+
+struct InterruptOnDrop {
+    handle: Arc<InterruptHandle>,
+    armed: bool,
+}
+
+impl InterruptOnDrop {
+    fn new(handle: Arc<InterruptHandle>) -> Self {
+        Self { handle, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InterruptOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.handle.interrupt();
+        }
     }
 }
 
@@ -194,7 +240,7 @@ pub fn test_backend(backend: &Backend) -> Result<()> {
 
 fn worker_main(
     receiver: &mpsc::Receiver<WorkerMessage>,
-    ready: &mpsc::SyncSender<Result<(), String>>,
+    ready: &mpsc::SyncSender<Result<Arc<InterruptHandle>, String>>,
     backends: &[Backend],
     init_sql: &str,
     max_rows: usize,
@@ -203,7 +249,7 @@ fn worker_main(
     let connection = initialize_connection(backends, init_sql, threads_per_worker);
     let connection = match connection {
         Ok(connection) => {
-            let _ = ready.send(Ok(()));
+            let _ = ready.send(Ok(connection.interrupt_handle()));
             connection
         }
         Err(error) => {
@@ -427,5 +473,20 @@ mod tests {
             .unwrap();
         assert_eq!(result.row_count, 1);
         assert_eq!(result.rows[0][1], "open");
+    }
+
+    #[test]
+    fn timeout_interrupts_query_worker() {
+        let config = Config {
+            workers: 1,
+            ..Config::default()
+        };
+        let mut pool = QueryPool::new(&config, "").unwrap();
+        pool.timeout = std::time::Duration::from_millis(10);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let error = runtime
+            .block_on(pool.query("SELECT sum(i) FROM range(100000000000) t(i)".into()))
+            .unwrap_err();
+        assert!(error.to_string().contains("timeout"));
     }
 }
