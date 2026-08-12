@@ -1,18 +1,51 @@
-use anyhow::{Context, Result, bail};
+use std::fmt;
+
+use anyhow::Result;
 use sqlparser::{ast::Statement, dialect::DuckDbDialect, parser::Parser};
+
+#[derive(Debug)]
+pub enum SqlValidationError {
+    Empty,
+    Parse(String),
+    StatementCount(usize),
+    NotReadOnly(String),
+}
+
+impl fmt::Display for SqlValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("SQL must not be empty"),
+            Self::Parse(error) => write!(formatter, "SQL could not be parsed as DuckDB SQL: {error}"),
+            Self::StatementCount(count) => {
+                write!(
+                    formatter,
+                    "exactly one SQL statement is allowed; received {count}"
+                )
+            }
+            Self::NotReadOnly(statement) => {
+                write!(
+                    formatter,
+                    "only read-only query statements are allowed; got {statement}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SqlValidationError {}
 
 pub fn validate_read_only(sql: &str) -> Result<()> {
     if sql.trim().is_empty() {
-        bail!("SQL must not be empty");
+        return Err(SqlValidationError::Empty.into());
     }
-    let statements =
-        Parser::parse_sql(&DuckDbDialect {}, sql).with_context(|| "SQL could not be parsed as DuckDB SQL")?;
+    let statements = Parser::parse_sql(&DuckDbDialect {}, sql)
+        .map_err(|error| SqlValidationError::Parse(error.to_string()))?;
     if statements.len() != 1 {
-        bail!("exactly one SQL statement is allowed");
+        return Err(SqlValidationError::StatementCount(statements.len()).into());
     }
     match &statements[0] {
         Statement::Query(_) | Statement::Explain { .. } | Statement::ExplainTable { .. } => Ok(()),
-        other => bail!("only read-only query statements are allowed; got {other}"),
+        other => Err(SqlValidationError::NotReadOnly(other.to_string()).into()),
     }
 }
 

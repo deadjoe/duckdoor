@@ -9,22 +9,22 @@ use serde_json::{Value, json};
 
 #[derive(Debug)]
 pub struct CommandError {
-    code: &'static str,
+    code: String,
     message: String,
     details: Value,
 }
 
 impl CommandError {
-    pub fn new(code: &'static str, message: impl Into<String>, details: Value) -> Self {
+    pub fn new(code: impl Into<String>, message: impl Into<String>, details: Value) -> Self {
         Self {
-            code,
+            code: code.into(),
             message: message.into(),
             details,
         }
     }
 
     pub fn write(&self) {
-        error_with_details(self.code, &self.message, &self.details);
+        error_with_details(&self.code, &self.message, &self.details);
     }
 }
 

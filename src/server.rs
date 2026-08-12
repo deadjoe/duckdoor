@@ -3,7 +3,7 @@ use std::{fs, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -17,7 +17,8 @@ use tracing::{error, info};
 
 use crate::{
     config::{Paths, load_config},
-    engine::Engine,
+    engine::{Engine, QueryError},
+    sql::SqlValidationError,
 };
 
 #[derive(Clone)]
@@ -27,6 +28,7 @@ struct AppState {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryRequest {
     pub sql: String,
 }
@@ -45,6 +47,8 @@ pub async fn run(paths: Paths) -> Result<()> {
         .route("/healthz", get(health))
         .route("/v1/query", post(query))
         .route("/v1/admin/reload", post(reload))
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .layer(CatchPanicLayer::new())
         .layer(RequestBodyLimitLayer::new(1024 * 1024))
         .layer(TimeoutLayer::with_status_code(
@@ -66,27 +70,30 @@ pub async fn run(paths: Paths) -> Result<()> {
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let (workers, enabled_backends) = state.engine.stats();
+    let pool_stats = state.engine.stats();
     Json(json!({
         "ok": true,
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "pid": std::process::id(),
-        "workers": workers,
-        "enabled_backends": enabled_backends,
+        "workers": pool_stats.workers,
+        "enabled_backends": pool_stats.enabled_backends,
+        "active_views": pool_stats.active_views,
+        "unavailable_views": pool_stats.unavailable_views,
     }))
 }
 
 async fn query(
     State(state): State<AppState>,
-    Json(request): Json<QueryRequest>,
+    request: Result<Json<QueryRequest>, JsonRejection>,
 ) -> Result<Json<crate::engine::QueryResult>, ApiError> {
+    let Json(request) = request.map_err(|rejection| ApiError::json_request(&rejection))?;
     let sql_bytes = request.sql.len();
     let result = state
         .engine
         .query(request.sql)
         .await
-        .map_err(|error| ApiError::bad_request(&error))?;
+        .map_err(|error| ApiError::query(&error))?;
     info!(
         sql_bytes,
         rows = result.row_count,
@@ -94,6 +101,22 @@ async fn query(
         "query completed"
     );
     Ok(Json(result))
+}
+
+async fn not_found() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "route_not_found",
+        "HTTP route does not exist",
+    )
+}
+
+async fn method_not_allowed() -> ApiError {
+    ApiError::new(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        "HTTP method is not allowed for this route",
+    )
 }
 
 async fn reload(
@@ -110,16 +133,21 @@ async fn reload(
             "invalid admin token",
         ));
     }
-    let (workers, enabled_backends) = state
-        .engine
-        .reload()
-        .map_err(|error| ApiError::bad_request(&error))?;
-    info!(workers, enabled_backends, "configuration reloaded");
+    let pool_stats = state.engine.reload().map_err(|error| ApiError::reload(&error))?;
+    info!(
+        workers = pool_stats.workers,
+        enabled_backends = pool_stats.enabled_backends,
+        active_views = pool_stats.active_views,
+        unavailable_views = pool_stats.unavailable_views,
+        "configuration reloaded"
+    );
     Ok(Json(json!({
         "ok": true,
         "status": "reloaded",
-        "workers": workers,
-        "enabled_backends": enabled_backends,
+        "workers": pool_stats.workers,
+        "enabled_backends": pool_stats.enabled_backends,
+        "active_views": pool_stats.active_views,
+        "unavailable_views": pool_stats.unavailable_views,
     })))
 }
 
@@ -138,9 +166,44 @@ impl ApiError {
         }
     }
 
-    fn bad_request(error: &anyhow::Error) -> Self {
+    fn query(error: &anyhow::Error) -> Self {
         error!(error = %error, "request failed");
-        Self::new(StatusCode::BAD_REQUEST, "invalid_query", format!("{error:#}"))
+        if let Some(validation) = error.downcast_ref::<SqlValidationError>() {
+            let code = match validation {
+                SqlValidationError::Empty
+                | SqlValidationError::Parse(_)
+                | SqlValidationError::StatementCount(_) => "invalid_sql",
+                SqlValidationError::NotReadOnly(_) => "query_not_read_only",
+            };
+            return Self::new(StatusCode::BAD_REQUEST, code, validation.to_string());
+        }
+        if let Some(query) = error.downcast_ref::<QueryError>() {
+            let (status, code) = match query {
+                QueryError::WorkersBusy => (StatusCode::SERVICE_UNAVAILABLE, "query_workers_busy"),
+                QueryError::WorkerStopped => (StatusCode::INTERNAL_SERVER_ERROR, "query_worker_stopped"),
+                QueryError::Timeout(_) => (StatusCode::REQUEST_TIMEOUT, "query_timeout"),
+                QueryError::Execution(_) => (StatusCode::BAD_REQUEST, "query_execution_failed"),
+            };
+            return Self::new(status, code, query.to_string());
+        }
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "query failed because of an internal gateway error",
+        )
+    }
+
+    fn reload(error: &anyhow::Error) -> Self {
+        error!(error = %error, "reload rejected");
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "reload_rejected",
+            format!("configuration could not be activated: {error:#}"),
+        )
+    }
+
+    fn json_request(rejection: &JsonRejection) -> Self {
+        Self::new(rejection.status(), "invalid_request_json", rejection.body_text())
     }
 }
 

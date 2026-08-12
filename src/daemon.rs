@@ -1,7 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    path::Path,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -10,8 +9,12 @@ use std::{
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde::Serialize;
+use serde_json::json;
 
-use crate::config::{Paths, load_config};
+use crate::{
+    config::{Paths, load_config},
+    output,
+};
 
 #[derive(Debug, Serialize)]
 pub struct DaemonAction {
@@ -66,7 +69,12 @@ impl Drop for PidGuard {
 pub fn start(paths: &Paths) -> Result<DaemonAction> {
     paths.ensure()?;
     if let Some(pid) = running_pid(paths)? {
-        bail!("duckdoor is already running (pid {pid})");
+        return Err(output::CommandError::new(
+            "daemon_already_running",
+            format!("duckdoor is already running with pid {pid}"),
+            json!({ "pid": pid, "state": "running", "resolution": "use `duckdoor restart` to restart it" }),
+        )
+        .into());
     }
     let log = OpenOptions::new().create(true).append(true).open(&paths.log)?;
     let stderr = log.try_clone()?;
@@ -111,7 +119,12 @@ pub fn start(paths: &Paths) -> Result<DaemonAction> {
 
 pub fn stop(paths: &Paths) -> Result<DaemonAction> {
     let Some(pid) = running_pid(paths)? else {
-        bail!("duckdoor is not running");
+        return Err(output::CommandError::new(
+            "daemon_not_running",
+            "duckdoor is not running",
+            json!({ "state": "stopped", "resolution": "use `duckdoor start` to start it" }),
+        )
+        .into());
     };
     let status = Command::new("kill").args(["-TERM", &pid.to_string()]).status()?;
     if !status.success() {
@@ -258,13 +271,4 @@ fn process_alive(pid: u32) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
-}
-
-pub fn ensure_sqlite_path(path: &Path) -> Result<std::path::PathBuf> {
-    let canonical =
-        fs::canonicalize(path).with_context(|| format!("could not resolve {}", path.display()))?;
-    if !canonical.is_file() {
-        bail!("not a regular file: {}", canonical.display());
-    }
-    Ok(canonical)
 }

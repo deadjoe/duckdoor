@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use serde_json::{Value, json};
 
 use crate::{
     config::{Paths, load_config},
@@ -29,7 +30,10 @@ struct ErrorEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct ErrorBody {
+    code: String,
     message: String,
+    #[serde(default)]
+    details: Value,
 }
 
 pub fn read_sql(argument: Option<String>, file: Option<std::path::PathBuf>) -> Result<String> {
@@ -57,33 +61,49 @@ pub fn query(paths: &Paths, sql: String) -> Result<QueryResult> {
         .post(format!("http://{}/v1/query", config.listen))
         .json(&QueryRequest { sql })
         .send()
-        .context("could not reach duckdoor; run `duckdoor start`")?;
+        .map_err(|error| {
+            output::CommandError::new(
+                "daemon_unreachable",
+                "could not reach the duckdoor daemon",
+                json!({
+                    "listen": config.listen,
+                    "cause": error.to_string(),
+                    "resolution": "run `duckdoor status`; start the daemon if it is stopped",
+                }),
+            )
+        })?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().unwrap_or_default();
-        let message = parse_error_message(&body);
-        bail!("query failed ({status}): {message}");
+        if let Some(error) = parse_structured_error(&body) {
+            let mut details = error.details;
+            if !details.is_object() {
+                details = json!({});
+            }
+            details["http_status"] = json!(status.as_u16());
+            return Err(output::CommandError::new(error.code, error.message, details).into());
+        }
+        return Err(output::CommandError::new(
+            "invalid_daemon_response",
+            "daemon returned an unstructured error response",
+            json!({ "http_status": status.as_u16(), "body": body }),
+        )
+        .into());
     }
-    response
-        .json()
-        .context("daemon returned an invalid query response")
+    response.json().map_err(|error| {
+        output::CommandError::new(
+            "invalid_daemon_response",
+            "daemon returned an invalid success response",
+            json!({ "cause": error.to_string() }),
+        )
+        .into()
+    })
 }
 
-fn parse_error_message(body: &str) -> String {
-    if let Ok(envelope) = serde_json::from_str::<ErrorEnvelope>(body) {
-        return envelope.error.message;
-    }
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body)
-        && let Some(message) = value.get("error").and_then(serde_json::Value::as_str)
-    {
-        return message.to_owned();
-    }
-    let body = body.trim();
-    if body.is_empty() {
-        "daemon returned an empty error response".to_owned()
-    } else {
-        body.to_owned()
-    }
+fn parse_structured_error(body: &str) -> Option<ErrorBody> {
+    serde_json::from_str::<ErrorEnvelope>(body)
+        .ok()
+        .map(|envelope| envelope.error)
 }
 
 pub fn print_result(result: &QueryResult, format: OutputFormat) -> Result<()> {
@@ -175,17 +195,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_structured_and_legacy_http_errors() {
-        assert_eq!(
-            parse_error_message(
-                r#"{"ok":false,"error":{"code":"invalid_query","message":"write rejected"}}"#,
-            ),
-            "write rejected"
-        );
-        assert_eq!(
-            parse_error_message(r#"{"error":"legacy message"}"#),
-            "legacy message"
-        );
-        assert_eq!(parse_error_message(""), "daemon returned an empty error response");
+    fn parses_structured_http_errors() {
+        let error = parse_structured_error(
+            r#"{"ok":false,"error":{"code":"query_not_read_only","message":"write rejected"}}"#,
+        )
+        .unwrap();
+        assert_eq!(error.code, "query_not_read_only");
+        assert_eq!(error.message, "write rejected");
+        assert!(parse_structured_error(r#"{"error":"legacy message"}"#).is_none());
     }
 }
