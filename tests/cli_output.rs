@@ -535,6 +535,34 @@ fn query_cli_preserves_specific_http_error_codes() {
     assert_eq!(value["error"]["code"], "query_not_read_only");
     assert_eq!(value["error"]["details"]["http_status"], 400);
 
+    let output = duckdoor()
+        .args([
+            "--home",
+            home.path().to_str().unwrap(),
+            "query",
+            "SELECT * FROM sqlite_query('app', 'SELECT 1')",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["error"]["code"], "query_source_function_not_allowed");
+    assert_eq!(value["error"]["details"]["http_status"], 400);
+
+    let healthy = duckdoor()
+        .args([
+            "--home",
+            home.path().to_str().unwrap(),
+            "query",
+            "SELECT 42 AS answer",
+        ])
+        .output()
+        .unwrap();
+    assert!(healthy.status.success());
+    let value: Value = serde_json::from_slice(&healthy.stdout).unwrap();
+    assert_eq!(value["data"]["rows"][0][0], 42);
+
     for (sql, expected_code) in [
         ("SELEC 1", "invalid_sql"),
         (

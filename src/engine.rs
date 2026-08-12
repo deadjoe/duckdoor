@@ -850,6 +850,23 @@ mod tests {
             .unwrap();
         assert_eq!(result.row_count, 1);
         assert_eq!(result.rows[0][1], "open");
+
+        let error = runtime
+            .block_on(pool.query("SELECT * FROM sqlite_query('app', 'SELECT * FROM events')".into()))
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::sql::SqlValidationError>()
+                .is_some_and(|error| matches!(
+                    error,
+                    crate::sql::SqlValidationError::SourceFunctionNotAllowed(_)
+                ))
+        );
+
+        let result = runtime
+            .block_on(pool.query("SELECT count(*) FROM app.events".into()))
+            .unwrap();
+        assert_eq!(result.rows[0][0], 1);
     }
 
     #[test]

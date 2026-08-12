@@ -345,14 +345,17 @@ Read-only behavior is enforced in layers:
 1. SQL is parsed before dispatch, and only one query or explain statement is
    accepted. DDL, DML, `COPY`, `ATTACH`, and multi-statement requests are
    rejected.
-2. SQLite and DuckDB files are attached with `READ_ONLY`.
-3. Parquet files are exposed only through read operations.
-4. Each DuckDB connection restricts allowed paths to the exact resolved source
+2. The parsed AST rejects direct source-opening and SQL pass-through functions,
+   including `sqlite_query`, `sqlite_scan`, `read_*`, `*_scan`, and dynamic
+   `query`. Clients use only registered relations and managed logical views.
+3. SQLite and DuckDB files are attached with `READ_ONLY`.
+4. Parquet files are exposed only through read operations.
+5. Each DuckDB connection restricts allowed paths to the exact resolved source
    files.
-5. Community extensions, extension auto-installation, extension auto-loading,
+6. Community extensions, extension auto-installation, extension auto-loading,
    and general external access are disabled after initialization.
-6. DuckDB configuration is locked after hardening.
-7. `init.sql` accepts only `CREATE VIEW` and `CREATE MACRO` statements.
+7. DuckDB configuration is locked after hardening.
+8. `init.sql` accepts only `CREATE VIEW` and `CREATE MACRO` statements.
 
 The reload endpoint requires a random admin token stored in the state directory
 with owner-only permissions on Unix. The query endpoint itself is intentionally
