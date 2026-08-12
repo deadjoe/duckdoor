@@ -140,7 +140,7 @@ impl QueryPool {
         let mut senders = Vec::with_capacity(config.workers);
         let mut started = Vec::with_capacity(config.workers);
         for worker_id in 0..config.workers {
-            let (sender, receiver) = mpsc::sync_channel(0);
+            let (sender, receiver) = mpsc::sync_channel(1);
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let backends = backends.clone();
             let views = views.clone();
@@ -922,6 +922,11 @@ mod tests {
             .block_on(pool.query("SELECT count(*) FROM app.events".into()))
             .unwrap();
         assert_eq!(result.rows[0][0], 1);
+
+        for _ in 0..100 {
+            let result = runtime.block_on(pool.query("SELECT 1".into())).unwrap();
+            assert_eq!(result.rows[0][0], 1);
+        }
     }
 
     #[test]

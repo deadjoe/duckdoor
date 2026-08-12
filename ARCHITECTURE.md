@@ -127,12 +127,13 @@ A query follows this sequence:
    additional row is observed to determine whether the result was truncated.
 7. The result returns through a Tokio one-shot channel and then through HTTP.
 
-Each worker uses a zero-capacity synchronous channel. A request can be handed
-off only while a worker is ready to receive it; requests are never accumulated
-in an internal work queue. If every worker is occupied or unavailable, the
-gateway immediately returns `query_workers_busy` with HTTP 503. This is
-intentional admission control: overload is explicit and does not silently turn
-into an arbitrarily long queue.
+Each worker uses a synchronous channel with capacity for one waiting request.
+The single slot removes a scheduler race at the instant a worker finishes one
+query and returns to receive the next, while keeping total queued work strictly
+bounded to one request per worker. If every worker is occupied and every slot is
+full, the gateway immediately returns `query_workers_busy` with HTTP 503. This
+is intentional admission control: overload is explicit and does not silently
+turn into an arbitrarily long queue.
 
 The configured query timeout is enforced around the worker response. If the
 deadline expires, or if the async request is otherwise dropped, duckdoor calls
@@ -154,8 +155,8 @@ The current performance design relies on several complementary choices:
 - **Fixed concurrency.** The number of workers and DuckDB threads per worker is
   explicit. The defaults use up to eight workers and one DuckDB execution thread
   per worker, limiting CPU oversubscription and latency jitter.
-- **No unbounded queue.** Zero-capacity handoff gives callers immediate,
-  machine-readable backpressure when all workers are busy.
+- **No unbounded queue.** At most one request can wait behind each worker;
+  callers get immediate, machine-readable backpressure after those slots fill.
 - **Low-contention selection.** An atomic counter chooses the first worker to
   try, and an idle worker can accept the request without a shared task queue.
 - **Atomic pool snapshots.** The active pool is held in `ArcSwap`. Ordinary
