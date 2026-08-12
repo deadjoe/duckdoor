@@ -931,12 +931,15 @@ mod tests {
             ..Config::default()
         };
         let mut pool = QueryPool::new(&config, "").unwrap();
-        pool.timeout = std::time::Duration::from_millis(10);
+        pool.timeout = std::time::Duration::ZERO;
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let error = runtime
             .block_on(pool.query("SELECT sum(i) FROM range(100000000000) t(i)".into()))
             .unwrap_err();
-        assert!(error.to_string().contains("timeout"));
+        assert!(matches!(
+            error.downcast_ref::<QueryError>(),
+            Some(QueryError::Timeout(0))
+        ));
     }
 
     #[test]
