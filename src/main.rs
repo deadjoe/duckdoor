@@ -73,9 +73,18 @@ enum Command {
         #[arg(long)]
         disabled: bool,
     },
-    /// Remove a backend registration (the `SQLite` file is never deleted).
-    #[command(after_help = "OUTPUT:\n  One JSON document. `sqlite_file_deleted` is always false.")]
-    Remove { name: String },
+    /// Remove one or all backend registrations (`SQLite` files are never deleted).
+    #[command(
+        after_help = "EXAMPLES:\n  duckdoor remove app\n  duckdoor remove --all\n\nOUTPUT:\n  One JSON document listing exactly what was unregistered. Source SQLite files are never deleted."
+    )]
+    Remove {
+        /// Name of one registered backend to remove.
+        #[arg(value_name = "NAME", required_unless_present = "all", conflicts_with = "all")]
+        name: Option<String>,
+        /// Atomically remove every backend registration.
+        #[arg(long)]
+        all: bool,
+    },
     /// Enable and hot-attach a backend.
     #[command(after_help = "OUTPUT:\n  One JSON document. `changed` is false when already enabled.")]
     Enable { name: String },
@@ -135,19 +144,27 @@ fn main() -> ExitCode {
         }
         Err(error) => {
             let rendered = error.to_string();
-            let message = rendered
-                .lines()
-                .next()
-                .unwrap_or("invalid command-line arguments")
-                .trim_start_matches("error: ");
-            output::error("invalid_arguments", message);
+            let message = concise_clap_error(&rendered);
+            let usage = clap_usage(&rendered);
+            output::error_with_details(
+                "invalid_arguments",
+                message,
+                &json!({
+                    "usage": usage,
+                    "help": "run the command with --help to see its arguments and examples",
+                }),
+            );
             return ExitCode::from(2);
         }
     };
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            output::error("command_failed", &format!("{error:#}"));
+            if let Some(error) = error.downcast_ref::<output::CommandError>() {
+                error.write();
+            } else {
+                output::error("command_failed", &format!("{error:#}"));
+            }
             ExitCode::FAILURE
         }
     }
@@ -165,7 +182,11 @@ fn run(cli: Cli) -> Result<()> {
         Command::Logs { lines, follow } => daemon::logs(&paths, lines, follow),
         Command::List => list(&paths),
         Command::Add { name, path, disabled } => add(&paths, &name, &path, !disabled),
-        Command::Remove { name } => remove(&paths, &name),
+        Command::Remove { name, all } => match (name, all) {
+            (Some(name), false) => remove(&paths, &name),
+            (None, true) => remove_all(&paths),
+            _ => unreachable!("clap validates remove arguments"),
+        },
         Command::Enable { name } => set_enabled(&paths, &name, true),
         Command::Disable { name } => set_enabled(&paths, &name, false),
         Command::Test { name } => test(&paths, &name),
@@ -177,6 +198,20 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Serve => tokio::runtime::Runtime::new()?.block_on(serve(paths)),
     }
+}
+
+fn concise_clap_error(rendered: &str) -> &str {
+    let body = rendered.trim().strip_prefix("error: ").unwrap_or(rendered.trim());
+    body.split("\n\nUsage:").next().unwrap_or(body).trim()
+}
+
+fn clap_usage(rendered: &str) -> Option<&str> {
+    rendered
+        .split("\n\nUsage:")
+        .nth(1)
+        .and_then(|usage| usage.lines().next())
+        .map(str::trim)
+        .filter(|usage| !usage.is_empty())
 }
 
 async fn serve(paths: Paths) -> Result<()> {
@@ -208,6 +243,19 @@ fn list(paths: &Paths) -> Result<()> {
 
 fn add(paths: &Paths, name: &str, path: &std::path::Path, enabled: bool) -> Result<()> {
     validate_name(name)?;
+    let current = load_config(paths)?;
+    if let Some(existing) = current.backends.iter().find(|item| item.name == name) {
+        return Err(output::CommandError::new(
+            "backend_already_exists",
+            format!("backend name '{name}' is already registered"),
+            json!({
+                "existing": existing,
+                "attempted_path": path,
+                "resolution": "choose a unique name or remove the existing registration first",
+            }),
+        )
+        .into());
+    }
     let path = daemon::ensure_sqlite_path(path)?;
     let backend = Backend {
         name: name.to_owned(),
@@ -217,7 +265,12 @@ fn add(paths: &Paths, name: &str, path: &std::path::Path, enabled: bool) -> Resu
     engine::test_backend(&backend).context("backend test failed")?;
     mutate_config(paths, |config| {
         if config.backends.iter().any(|item| item.name == name) {
-            bail!("backend already exists: {name}");
+            return Err(output::CommandError::new(
+                "backend_already_exists",
+                format!("backend name '{name}' was registered concurrently"),
+                json!({ "attempted_path": backend.path }),
+            )
+            .into());
         }
         config.backends.push(backend.clone());
         Ok(())
@@ -236,7 +289,15 @@ fn remove(paths: &Paths, name: &str) -> Result<()> {
         let old_len = config.backends.len();
         config.backends.retain(|item| item.name != name);
         if config.backends.len() == old_len {
-            bail!("unknown backend: {name}");
+            return Err(output::CommandError::new(
+                "backend_not_found",
+                format!("backend '{name}' is not registered"),
+                json!({
+                    "requested_name": name,
+                    "registered_names": config.backends.iter().map(|item| &item.name).collect::<Vec<_>>(),
+                }),
+            )
+            .into());
         }
         Ok(())
     })?;
@@ -247,6 +308,39 @@ fn remove(paths: &Paths, name: &str) -> Result<()> {
             "registration_removed": true,
             "sqlite_file_deleted": false,
             "configuration_reloaded": daemon::running_pid(paths)?.is_some(),
+        }),
+    )
+}
+
+fn remove_all(paths: &Paths) -> Result<()> {
+    let _lock = lock_config(paths)?;
+    let previous = load_config(paths)?;
+    if previous.backends.is_empty() {
+        return output::success(
+            "remove",
+            json!({
+                "scope": "all",
+                "changed": false,
+                "removed_count": 0,
+                "removed": [],
+                "sqlite_files_deleted": 0,
+                "configuration_reloaded": false,
+            }),
+        );
+    }
+    let mut updated = previous.clone();
+    updated.backends.clear();
+    let daemon_running = daemon::running_pid(paths)?.is_some();
+    save_and_reload(paths, &previous, &updated)?;
+    output::success(
+        "remove",
+        json!({
+            "scope": "all",
+            "changed": true,
+            "removed_count": previous.backends.len(),
+            "removed": previous.backends,
+            "sqlite_files_deleted": 0,
+            "configuration_reloaded": daemon_running,
         }),
     )
 }
