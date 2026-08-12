@@ -2,21 +2,25 @@ mod client;
 mod config;
 mod daemon;
 mod engine;
+mod output;
 mod server;
 mod sql;
 
-use std::{fs, fs::OpenOptions, net::SocketAddr, path::PathBuf};
+use std::{fs, fs::OpenOptions, net::SocketAddr, path::PathBuf, process::ExitCode};
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, error::ErrorKind};
 use config::{Backend, Config, Paths, load_config, save_config, validate_name};
 use fs2::FileExt;
+use serde_json::json;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "duckdoor",
     version,
-    about = "Read-only DuckDB gateway for SQLite fleets"
+    about = "Read-only DuckDB gateway for SQLite fleets",
+    arg_required_else_help = true,
+    after_help = "OUTPUT:\n  Commands emit one compact JSON document by default.\n  `logs` emits JSON Lines. `query --output table|csv|jsonl` is opt-in.\n\nEXAMPLES:\n  duckdoor add app /absolute/path/app.sqlite\n  duckdoor start\n  duckdoor query 'SELECT count(*) FROM app.events'\n  duckdoor status"
 )]
 struct Cli {
     /// Configuration and state directory.
@@ -29,16 +33,26 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start the gateway in the background.
+    #[command(after_help = "OUTPUT:\n  One JSON document describing the running daemon.")]
     Start,
     /// Stop the background gateway.
+    #[command(after_help = "OUTPUT:\n  One JSON document describing the stopped daemon.")]
     Stop,
     /// Stop and start the gateway.
+    #[command(after_help = "OUTPUT:\n  One JSON document describing the restarted daemon.")]
     Restart,
     /// Show daemon and health state.
+    #[command(after_help = "OUTPUT:\n  One JSON document. `data.state` is running, unhealthy, or stopped.")]
     Status,
     /// Validate configuration, backends, and the query engine.
+    #[command(
+        after_help = "OUTPUT:\n  One JSON document containing config, backend, engine, daemon, and warning checks."
+    )]
     Doctor,
     /// Stream structured gateway logs.
+    #[command(
+        after_help = "OUTPUT:\n  JSON Lines: one complete log event per line. Use --no-follow for a finite response."
+    )]
     Logs {
         #[arg(short = 'n', long, default_value_t = 100)]
         lines: usize,
@@ -46,30 +60,52 @@ enum Command {
         follow: bool,
     },
     /// List registered `SQLite` backends.
+    #[command(after_help = "OUTPUT:\n  One JSON document with counts and the registered backend array.")]
     List,
     /// Register a `SQLite` backend.
+    #[command(after_help = "OUTPUT:\n  One JSON document with the canonical backend path and reload state.")]
     Add {
+        /// Catalog name used as `name.table` in queries.
         name: String,
+        /// Absolute or relative path to an existing `SQLite` file.
         path: PathBuf,
+        /// Register the backend without attaching it to query workers.
         #[arg(long)]
         disabled: bool,
     },
     /// Remove a backend registration (the `SQLite` file is never deleted).
+    #[command(after_help = "OUTPUT:\n  One JSON document. `sqlite_file_deleted` is always false.")]
     Remove { name: String },
     /// Enable and hot-attach a backend.
+    #[command(after_help = "OUTPUT:\n  One JSON document. `changed` is false when already enabled.")]
     Enable { name: String },
     /// Disable and hot-detach a backend.
+    #[command(after_help = "OUTPUT:\n  One JSON document. `changed` is false when already disabled.")]
     Disable { name: String },
     /// Test a registered backend without changing it.
+    #[command(after_help = "OUTPUT:\n  One JSON document confirming read-only attach compatibility.")]
     Test { name: String },
     /// Hot-reload configuration and init.sql.
+    #[command(after_help = "OUTPUT:\n  One JSON document containing the active worker and backend counts.")]
     Reload,
     /// Run one read-only SQL query through the daemon.
+    #[command(
+        after_help = "INPUT:\n  Provide SQL as one argument, with --file, or on stdin.\n\nOUTPUT:\n  json (default): one JSON document with columns, rows, counts, and timing.\n  jsonl: one JSON object per result row.\n  csv: header plus result rows.\n  table: compact human-readable columns without separator art."
+    )]
     Query {
+        /// One read-only SQL statement. Reads stdin when omitted.
         sql: Option<String>,
+        /// Read the SQL statement from a UTF-8 file.
         #[arg(short, long)]
         file: Option<PathBuf>,
-        #[arg(short = 'o', long, value_enum, default_value_t = client::OutputFormat::Table)]
+        /// Output format. JSON is the stable default for humans and agents.
+        #[arg(
+            short = 'o',
+            long = "output",
+            visible_alias = "format",
+            value_enum,
+            default_value_t = client::OutputFormat::Json
+        )]
         format: client::OutputFormat,
     },
     /// Run the HTTP service in the foreground.
@@ -77,22 +113,54 @@ enum Command {
     Serve,
 }
 
-fn main() {
-    if let Err(error) = run() {
-        eprintln!("error: {error:#}");
-        std::process::exit(1);
+fn main() -> ExitCode {
+    if std::env::args_os().len() == 1 {
+        let mut command = Cli::command();
+        let _ = command.print_help();
+        println!();
+        return ExitCode::SUCCESS;
+    }
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) =>
+        {
+            let _ = error.print();
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => {
+            let rendered = error.to_string();
+            let message = rendered
+                .lines()
+                .next()
+                .unwrap_or("invalid command-line arguments")
+                .trim_start_matches("error: ");
+            output::error("invalid_arguments", message);
+            return ExitCode::from(2);
+        }
+    };
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            output::error("command_failed", &format!("{error:#}"));
+            ExitCode::FAILURE
+        }
     }
 }
 
-fn run() -> Result<()> {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> Result<()> {
     let paths = Paths::resolve(cli.home)?;
     paths.ensure()?;
     match cli.command {
-        Command::Start => daemon::start(&paths),
-        Command::Stop => daemon::stop(&paths),
-        Command::Restart => daemon::restart(&paths),
-        Command::Status => daemon::status(&paths),
+        Command::Start => output::success("start", daemon::start(&paths)?),
+        Command::Stop => output::success("stop", daemon::stop(&paths)?),
+        Command::Restart => output::success("restart", daemon::restart(&paths)?),
+        Command::Status => output::success("status", daemon::status(&paths)?),
         Command::Doctor => doctor(&paths),
         Command::Logs { lines, follow } => daemon::logs(&paths, lines, follow),
         Command::List => list(&paths),
@@ -101,10 +169,7 @@ fn run() -> Result<()> {
         Command::Enable { name } => set_enabled(&paths, &name, true),
         Command::Disable { name } => set_enabled(&paths, &name, false),
         Command::Test { name } => test(&paths, &name),
-        Command::Reload => {
-            println!("{}", serde_json::to_string_pretty(&daemon::reload(&paths)?)?);
-            Ok(())
-        }
+        Command::Reload => output::success("reload", daemon::reload(&paths)?),
         Command::Query { sql, file, format } => {
             let sql = client::read_sql(sql, file)?;
             let result = client::query(&paths, sql)?;
@@ -129,20 +194,16 @@ async fn serve(paths: Paths) -> Result<()> {
 
 fn list(paths: &Paths) -> Result<()> {
     let config = load_config(paths)?;
-    if config.backends.is_empty() {
-        println!("No backends registered.");
-        return Ok(());
-    }
-    println!("NAME\tSTATE\tPATH");
-    for backend in config.backends {
-        println!(
-            "{}\t{}\t{}",
-            backend.name,
-            if backend.enabled { "enabled" } else { "disabled" },
-            backend.path.display()
-        );
-    }
-    Ok(())
+    let enabled = config.backends.iter().filter(|backend| backend.enabled).count();
+    output::success(
+        "list",
+        json!({
+            "count": config.backends.len(),
+            "enabled": enabled,
+            "disabled": config.backends.len() - enabled,
+            "backends": config.backends,
+        }),
+    )
 }
 
 fn add(paths: &Paths, name: &str, path: &std::path::Path, enabled: bool) -> Result<()> {
@@ -158,11 +219,16 @@ fn add(paths: &Paths, name: &str, path: &std::path::Path, enabled: bool) -> Resu
         if config.backends.iter().any(|item| item.name == name) {
             bail!("backend already exists: {name}");
         }
-        config.backends.push(backend);
+        config.backends.push(backend.clone());
         Ok(())
     })?;
-    println!("added {name} ({})", if enabled { "enabled" } else { "disabled" });
-    Ok(())
+    output::success(
+        "add",
+        json!({
+            "backend": backend,
+            "configuration_reloaded": daemon::running_pid(paths)?.is_some(),
+        }),
+    )
 }
 
 fn remove(paths: &Paths, name: &str) -> Result<()> {
@@ -174,8 +240,15 @@ fn remove(paths: &Paths, name: &str) -> Result<()> {
         }
         Ok(())
     })?;
-    println!("removed registration {name}; the SQLite file was not touched");
-    Ok(())
+    output::success(
+        "remove",
+        json!({
+            "name": name,
+            "registration_removed": true,
+            "sqlite_file_deleted": false,
+            "configuration_reloaded": daemon::running_pid(paths)?.is_some(),
+        }),
+    )
 }
 
 fn set_enabled(paths: &Paths, name: &str, enabled: bool) -> Result<()> {
@@ -191,16 +264,22 @@ fn set_enabled(paths: &Paths, name: &str, enabled: bool) -> Result<()> {
         engine::test_backend(backend).context("backend test failed")?;
     }
     if backend.enabled == enabled {
-        println!(
-            "{name} is already {}",
-            if enabled { "enabled" } else { "disabled" }
+        return output::success(
+            if enabled { "enable" } else { "disable" },
+            json!({ "name": name, "enabled": enabled, "changed": false }),
         );
-        return Ok(());
     }
     backend.enabled = enabled;
     save_and_reload(paths, &previous, &config)?;
-    println!("{name} {}", if enabled { "enabled" } else { "disabled" });
-    Ok(())
+    output::success(
+        if enabled { "enable" } else { "disable" },
+        json!({
+            "name": name,
+            "enabled": enabled,
+            "changed": true,
+            "configuration_reloaded": daemon::running_pid(paths)?.is_some(),
+        }),
+    )
 }
 
 fn test(paths: &Paths, name: &str) -> Result<()> {
@@ -211,8 +290,14 @@ fn test(paths: &Paths, name: &str) -> Result<()> {
         .find(|item| item.name == name)
         .with_context(|| format!("unknown backend: {name}"))?;
     engine::test_backend(backend)?;
-    println!("ok: {} ({})", backend.name, backend.path.display());
-    Ok(())
+    output::success(
+        "test",
+        json!({
+            "backend": backend,
+            "attach": "ok",
+            "read_only": true,
+        }),
+    )
 }
 
 fn mutate_config(function_paths: &Paths, mutate: impl FnOnce(&mut Config) -> Result<()>) -> Result<()> {
@@ -249,23 +334,27 @@ fn save_and_reload(paths: &Paths, previous: &Config, updated: &Config) -> Result
 }
 
 fn doctor(paths: &Paths) -> Result<()> {
-    println!("home: {}", paths.home.display());
     let config = load_config(paths)?;
-    println!("config: ok ({})", paths.config.display());
     let address: SocketAddr = config
         .listen
         .parse()
         .context("listen must be an IP socket address")?;
+    let mut warnings = Vec::new();
     if !address.ip().is_loopback() {
-        println!("warning: {address} is not loopback; put authentication and TLS in front of duckdoor");
+        warnings.push(format!(
+            "{address} is not loopback; put authentication and TLS in front of duckdoor"
+        ));
     }
+    let mut backends = Vec::with_capacity(config.backends.len());
     for backend in &config.backends {
         engine::test_backend(backend).with_context(|| format!("backend {} failed", backend.name))?;
-        println!(
-            "backend {}: ok{}",
-            backend.name,
-            if backend.enabled { "" } else { " (disabled)" }
-        );
+        backends.push(json!({
+            "name": backend.name,
+            "path": backend.path,
+            "enabled": backend.enabled,
+            "attach": "ok",
+            "read_only": true,
+        }));
     }
     let init = fs::read_to_string(&paths.init_sql)?;
     let pool = engine::QueryPool::new(
@@ -276,13 +365,26 @@ fn doctor(paths: &Paths) -> Result<()> {
         &init,
     )?;
     tokio::runtime::Runtime::new()?.block_on(pool.query("SELECT 42 AS answer".to_owned()))?;
-    println!("engine: ok (DuckDB {}, 1 probe worker)", duckdb_version());
-    match daemon::running_pid(paths)? {
-        Some(pid) => println!("daemon: healthy (pid {pid}, {})", daemon::health(paths)?),
-        None => println!("daemon: stopped (configuration is ready)"),
+    if let Some(pid) = daemon::running_pid(paths)? {
+        daemon::health(paths).with_context(|| format!("daemon pid {pid} is unhealthy"))?;
     }
-    println!("doctor: all checks passed");
-    Ok(())
+    output::success(
+        "doctor",
+        json!({
+            "status": "ok",
+            "home": paths.home,
+            "config": { "status": "ok", "path": paths.config },
+            "listen": config.listen,
+            "backends": backends,
+            "engine": {
+                "status": "ok",
+                "duckdb_version": duckdb_version(),
+                "probe_workers": 1,
+            },
+            "daemon": daemon::status(paths)?,
+            "warnings": warnings,
+        }),
+    )
 }
 
 fn duckdb_version() -> &'static str {

@@ -35,7 +35,8 @@ duckdoor add logs /absolute/path/logs.sqlite --disabled
 duckdoor start
 
 duckdoor query 'SELECT count(*) FROM app_a.events'
-duckdoor query -o json 'SELECT * FROM app_a.events LIMIT 10'
+duckdoor query 'SELECT * FROM app_a.events LIMIT 10'
+duckdoor query -o table 'SELECT * FROM app_a.events LIMIT 10'
 printf 'SELECT 42 AS answer' | duckdoor query -o jsonl
 
 duckdoor enable logs
@@ -56,6 +57,25 @@ query:    query reload
 
 `remove` only removes the registration. It never deletes or changes a SQLite file. Changes made while the daemon is running are validated and hot-reloaded; a failed reload rolls the configuration back.
 
+## CLI output contract
+
+`duckdoor` is designed for scripts and coding agents as well as interactive use:
+
+- Every finite command writes exactly one compact JSON document to stdout by default.
+- Successful documents use `{ "ok": true, "command": "...", "data": ... }`.
+- Runtime and argument errors write `{ "ok": false, "error": { "code": "...", "message": "..." } }` to stderr and exit non-zero.
+- `duckdoor logs` emits JSON Lines because it is a stream.
+- `duckdoor query` defaults to JSON. `--output jsonl`, `csv`, and the compact human-only `table` format are explicit alternatives.
+- Running `duckdoor` with no arguments prints help and exits successfully.
+
+This makes outputs unambiguous and directly consumable with `jq`:
+
+```sh
+duckdoor status | jq -r '.data.state'
+duckdoor list | jq '.data.backends[] | {name, enabled, path}'
+duckdoor query 'SELECT count(*) AS n FROM app_a.events' | jq '.data.rows[0][0]'
+```
+
 ## HTTP API
 
 The server listens on `127.0.0.1:9494` by default.
@@ -68,7 +88,7 @@ curl -sS http://127.0.0.1:9494/v1/query \
   -d '{"sql":"SELECT count(*) AS n FROM app_a.events"}'
 ```
 
-Successful query responses contain `columns`, row arrays, `row_count`, `truncated`, and `elapsed_ms`. Values that JSON cannot represent losslessly—such as 128-bit integers and decimals—are strings. BLOB values are base64.
+Successful HTTP query responses contain `columns`, row arrays, `row_count`, `truncated`, and `elapsed_ms`. CLI JSON wraps that response in its standard `ok`/`command`/`data` envelope. Health responses include the daemon PID so lifecycle checks cannot mistake another process on the configured port for the newly started instance. Values that JSON cannot represent losslessly—such as 128-bit integers and decimals—are strings. BLOB values are base64.
 
 Only one read-only `SELECT`, `VALUES`, `WITH`, or `EXPLAIN` statement is accepted per request. Results are capped by `max_rows` (10,000 by default), request bodies are capped at 1 MiB, work queues are bounded, and request time is limited. The daemon installs/loads SQLite before hardening each worker, then disables external access and extension loading and locks DuckDB configuration.
 

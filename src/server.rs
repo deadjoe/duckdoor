@@ -68,8 +68,10 @@ pub async fn run(paths: Paths) -> Result<()> {
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     let (workers, enabled_backends) = state.engine.stats();
     Json(json!({
+        "ok": true,
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        "pid": std::process::id(),
         "workers": workers,
         "enabled_backends": enabled_backends,
     }))
@@ -102,40 +104,59 @@ async fn reload(
         .get("x-duckdoor-admin-token")
         .and_then(|value| value.to_str().ok());
     if supplied != Some(state.admin_token.as_ref()) {
-        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid admin token"));
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "invalid admin token",
+        ));
     }
     let (workers, enabled_backends) = state
         .engine
         .reload()
         .map_err(|error| ApiError::bad_request(&error))?;
     info!(workers, enabled_backends, "configuration reloaded");
-    Ok(Json(
-        json!({ "status": "reloaded", "workers": workers, "enabled_backends": enabled_backends }),
-    ))
+    Ok(Json(json!({
+        "ok": true,
+        "status": "reloaded",
+        "workers": workers,
+        "enabled_backends": enabled_backends,
+    })))
 }
 
 struct ApiError {
     status: StatusCode,
+    code: &'static str,
     message: String,
 }
 
 impl ApiError {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,
+            code,
             message: message.into(),
         }
     }
 
     fn bad_request(error: &anyhow::Error) -> Self {
         error!(error = %error, "request failed");
-        Self::new(StatusCode::BAD_REQUEST, format!("{error:#}"))
+        Self::new(StatusCode::BAD_REQUEST, "invalid_query", format!("{error:#}"))
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        (
+            self.status,
+            Json(json!({
+                "ok": false,
+                "error": {
+                    "code": self.code,
+                    "message": self.message,
+                },
+            })),
+        )
+            .into_response()
     }
 }
 
@@ -155,4 +176,15 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! { () = ctrl_c => {}, () = terminate => {} }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_errors_use_the_stable_envelope() {
+        let response = ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", "bad token").into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }

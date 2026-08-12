@@ -9,8 +9,27 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
+use serde::Serialize;
 
 use crate::config::{Paths, load_config};
+
+#[derive(Debug, Serialize)]
+pub struct DaemonAction {
+    pub state: &'static str,
+    pub pid: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DaemonStatus {
+    pub state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub home: std::path::PathBuf,
+}
 
 pub struct PidGuard {
     file: File,
@@ -44,7 +63,7 @@ impl Drop for PidGuard {
     }
 }
 
-pub fn start(paths: &Paths) -> Result<()> {
+pub fn start(paths: &Paths) -> Result<DaemonAction> {
     paths.ensure()?;
     if let Some(pid) = running_pid(paths)? {
         bail!("duckdoor is already running (pid {pid})");
@@ -74,9 +93,13 @@ pub fn start(paths: &Paths) -> Result<()> {
                 paths.log.display()
             );
         }
-        if health(paths).is_ok() {
-            println!("duckdoor started (pid {})", child.id());
-            return Ok(());
+        if health(paths).is_ok_and(|body| {
+            body.get("pid").and_then(serde_json::Value::as_u64) == Some(u64::from(child.id()))
+        }) {
+            return Ok(DaemonAction {
+                state: "running",
+                pid: child.id(),
+            });
         }
         thread::sleep(Duration::from_millis(150));
     }
@@ -86,7 +109,7 @@ pub fn start(paths: &Paths) -> Result<()> {
     )
 }
 
-pub fn stop(paths: &Paths) -> Result<()> {
+pub fn stop(paths: &Paths) -> Result<DaemonAction> {
     let Some(pid) = running_pid(paths)? else {
         bail!("duckdoor is not running");
     };
@@ -97,34 +120,66 @@ pub fn stop(paths: &Paths) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         if !process_alive(pid) {
-            println!("duckdoor stopped");
-            return Ok(());
+            return Ok(DaemonAction {
+                state: "stopped",
+                pid,
+            });
         }
         thread::sleep(Duration::from_millis(100));
     }
     bail!("daemon pid {pid} did not stop within 15 seconds")
 }
 
-pub fn restart(paths: &Paths) -> Result<()> {
+pub fn restart(paths: &Paths) -> Result<DaemonAction> {
     if running_pid(paths)?.is_some() {
         stop(paths)?;
     }
-    start(paths)
+    let started = start(paths)?;
+    Ok(DaemonAction {
+        state: "running",
+        pid: started.pid,
+    })
 }
 
-pub fn status(paths: &Paths) -> Result<()> {
-    match running_pid(paths)? {
+pub fn status(paths: &Paths) -> Result<DaemonStatus> {
+    Ok(match running_pid(paths)? {
         Some(pid) => match health(paths) {
-            Ok(body) => println!("running (pid {pid})\n{}", serde_json::to_string_pretty(&body)?),
-            Err(error) => println!("starting or unhealthy (pid {pid}): {error:#}"),
+            Ok(body) => DaemonStatus {
+                state: "running",
+                pid: Some(pid),
+                health: Some(body),
+                error: None,
+                home: paths.home.clone(),
+            },
+            Err(error) => DaemonStatus {
+                state: "unhealthy",
+                pid: Some(pid),
+                health: None,
+                error: Some(format!("{error:#}")),
+                home: paths.home.clone(),
+            },
         },
-        None if paths.pid.exists() => println!("stopped (stale pid file: {})", paths.pid.display()),
-        None => println!("stopped"),
-    }
-    Ok(())
+        None if paths.pid.exists() => DaemonStatus {
+            state: "stopped",
+            pid: None,
+            health: None,
+            error: Some(format!("stale pid file: {}", paths.pid.display())),
+            home: paths.home.clone(),
+        },
+        None => DaemonStatus {
+            state: "stopped",
+            pid: None,
+            health: None,
+            error: None,
+            home: paths.home.clone(),
+        },
+    })
 }
 
 pub fn logs(paths: &Paths, lines: usize, follow: bool) -> Result<()> {
+    if !paths.log.exists() {
+        return Ok(());
+    }
     if follow {
         let status = Command::new("tail")
             .arg("-n")
