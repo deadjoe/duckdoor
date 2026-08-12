@@ -27,6 +27,27 @@ The executable contains DuckDB itself. On the first SQLite registration, DuckDB 
 
 `duckdoor` currently targets macOS and Linux. By default its files live in the platform configuration directory. Set `DUCKDOOR_HOME` or pass `--home` to use another directory.
 
+### Safely update a deployed binary
+
+Stop the daemon before replacing its executable. Copy an update to a new file in the same directory, verify that candidate, and then rename it over the installed path. The rename is atomic; do not use `scp` to overwrite the executable in place while duckdoor is running. On macOS, modifying a running Mach-O file in place can make the kernel reject it with a code-signing error and `SIGKILL`.
+
+For example, from the build machine, replacing `~/.local/bin/duckdoor` on `HOST`:
+
+```sh
+ssh HOST '~/.local/bin/duckdoor stop'
+scp target/release/duckdoor HOST:~/.local/bin/duckdoor.new
+
+ssh HOST '
+  chmod 755 ~/.local/bin/duckdoor.new &&
+  ~/.local/bin/duckdoor.new --version &&
+  mv ~/.local/bin/duckdoor.new ~/.local/bin/duckdoor &&
+  ~/.local/bin/duckdoor start &&
+  ~/.local/bin/duckdoor doctor
+'
+```
+
+Compare the candidate's SHA-256 checksum with the build artifact before the rename. On macOS, `codesign --verify --verbose=4 ~/.local/bin/duckdoor.new` provides an additional check. Replacing the executable does not change the configuration, registered backend paths, or SQLite files.
+
 ## Quick start
 
 ```sh
