@@ -41,6 +41,7 @@ printf 'SELECT 42 AS answer' | duckdoor query -o jsonl
 
 duckdoor enable logs
 duckdoor list
+duckdoor remove --all
 duckdoor status
 duckdoor logs
 ```
@@ -55,7 +56,7 @@ backends: list add remove enable disable test
 query:    query reload
 ```
 
-`remove` only removes the registration. It never deletes or changes a SQLite file. Changes made while the daemon is running are validated and hot-reloaded; a failed reload rolls the configuration back.
+`remove NAME` removes one registration. `remove --all` atomically clears every registration and is idempotent when the registry is already empty. Neither form deletes or changes a SQLite file. Changes made while the daemon is running are validated and hot-reloaded; a failed reload rolls the configuration back.
 
 ## CLI output contract
 
@@ -63,7 +64,7 @@ query:    query reload
 
 - Every finite command writes exactly one compact JSON document to stdout by default.
 - Successful documents use `{ "ok": true, "command": "...", "data": ... }`.
-- Runtime and argument errors write `{ "ok": false, "error": { "code": "...", "message": "..." } }` to stderr and exit non-zero.
+- Runtime and argument errors write `{ "ok": false, "error": { "code": "...", "message": "..." } }` to stderr and exit non-zero. When available, `error.details` supplies machine-readable context such as exact usage, the conflicting backend, or registered names.
 - `duckdoor logs` emits JSON Lines because it is a stream.
 - `duckdoor query` defaults to JSON. `--output jsonl`, `csv`, and the compact human-only `table` format are explicit alternatives.
 - Running `duckdoor` with no arguments prints help and exits successfully.
