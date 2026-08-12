@@ -5,19 +5,31 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 
 use crate::{
     config::{Paths, load_config},
     engine::QueryResult,
+    output,
     server::QueryRequest,
 };
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum OutputFormat {
-    Table,
     Json,
     Jsonl,
     Csv,
+    Table,
+}
+
+#[derive(Debug, Deserialize)]
+struct ErrorEnvelope {
+    error: ErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct ErrorBody {
+    message: String,
 }
 
 pub fn read_sql(argument: Option<String>, file: Option<std::path::PathBuf>) -> Result<String> {
@@ -49,16 +61,34 @@ pub fn query(paths: &Paths, sql: String) -> Result<QueryResult> {
     let status = response.status();
     if !status.is_success() {
         let body = response.text().unwrap_or_default();
-        bail!("query failed ({status}): {body}");
+        let message = parse_error_message(&body);
+        bail!("query failed ({status}): {message}");
     }
     response
         .json()
         .context("daemon returned an invalid query response")
 }
 
+fn parse_error_message(body: &str) -> String {
+    if let Ok(envelope) = serde_json::from_str::<ErrorEnvelope>(body) {
+        return envelope.error.message;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body)
+        && let Some(message) = value.get("error").and_then(serde_json::Value::as_str)
+    {
+        return message.to_owned();
+    }
+    let body = body.trim();
+    if body.is_empty() {
+        "daemon returned an empty error response".to_owned()
+    } else {
+        body.to_owned()
+    }
+}
+
 pub fn print_result(result: &QueryResult, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(result)?),
+        OutputFormat::Json => output::success("query", result)?,
         OutputFormat::Jsonl => {
             for row in &result.rows {
                 let object = result
@@ -82,8 +112,12 @@ pub fn print_result(result: &QueryResult, format: OutputFormat) -> Result<()> {
         }
         OutputFormat::Table => print_table(result),
     }
-    if result.truncated {
-        eprintln!("warning: result truncated at {} rows", result.row_count);
+    if result.truncated && !matches!(format, OutputFormat::Json) {
+        output::warning(
+            "result_truncated",
+            "query result reached the configured row limit",
+            serde_json::json!({ "row_count": result.row_count }),
+        );
     }
     Ok(())
 }
@@ -111,18 +145,10 @@ fn print_table(result: &QueryResult) {
             .collect::<Vec<_>>(),
         &widths,
     );
-    println!(
-        "{}",
-        widths
-            .iter()
-            .map(|width| "-".repeat(*width + 2))
-            .collect::<Vec<_>>()
-            .join("+")
-    );
     for row in &result.rows {
         print_row(&row.iter().map(display_value).collect::<Vec<_>>(), &widths);
     }
-    println!("({} rows, {:.3} ms)", result.row_count, result.elapsed_ms);
+    println!("rows={} elapsed_ms={:.3}", result.row_count, result.elapsed_ms);
 }
 
 fn print_row(values: &[String], widths: &[usize]) {
@@ -141,5 +167,25 @@ fn display_value(value: &serde_json::Value) -> String {
         serde_json::Value::Null => "NULL".to_owned(),
         serde_json::Value::String(value) => value.clone(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_structured_and_legacy_http_errors() {
+        assert_eq!(
+            parse_error_message(
+                r#"{"ok":false,"error":{"code":"invalid_query","message":"write rejected"}}"#,
+            ),
+            "write rejected"
+        );
+        assert_eq!(
+            parse_error_message(r#"{"error":"legacy message"}"#),
+            "legacy message"
+        );
+        assert_eq!(parse_error_message(""), "daemon returned an empty error response");
     }
 }
