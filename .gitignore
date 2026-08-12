@@ -1,0 +1,10 @@
+/target/
+*.duckdb
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+.idea/
+.vscode/
