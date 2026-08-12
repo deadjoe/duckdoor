@@ -10,6 +10,8 @@ Parquet files ┘                    embedded DuckDB
 
 DuckDB reads source data directly when a query runs. `duckdoor` does not copy or materialize it. SQLite and DuckDB files are attached with `READ_ONLY`; Parquet is exposed through `read_parquet` with only registered files allowed.
 
+For the process model, query path, worker-pool design, reload semantics, data-virtualization implementation, and security boundaries, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Why not Quack?
 
 [Quack](https://github.com/duckdb/duckdb-quack) is DuckDB's promising native client/server protocol, but it is currently published as an experimental pre-release. The stable path in `duckdoor` is therefore its Rust HTTP service. Quack compatibility can be added later without making registry, lifecycle, or HTTP availability depend on it.
