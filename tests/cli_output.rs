@@ -42,7 +42,7 @@ fn assert_query_error(home: &Path, sql: &str, expected_code: &str) -> Value {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"");
     let value: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(value["error"]["code"], expected_code);
     assert_eq!(value["error"]["details"]["http_status"], 400);
@@ -65,7 +65,7 @@ impl Drop for DaemonGuard {
 fn empty_command_prints_help_and_succeeds() {
     let output = duckdoor().output().unwrap();
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr, b"");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Usage: duckdoor [OPTIONS] <COMMAND>"));
     assert!(stdout.contains("Commands emit one compact JSON document by default"));
@@ -89,7 +89,7 @@ fn finite_commands_emit_one_json_document() {
             .output()
             .unwrap();
         assert!(output.status.success());
-        assert!(output.stderr.is_empty());
+        assert_eq!(output.stderr, b"");
         let value: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["ok"], true);
         assert_eq!(value["command"], command);
@@ -260,7 +260,7 @@ fn logical_view_hot_reloads_with_backend_enable_state() {
 fn invalid_arguments_emit_json_to_stderr() {
     let output = duckdoor().arg("unknown-command").output().unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"");
     let value: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "invalid_arguments");
@@ -283,7 +283,7 @@ fn invalid_configuration_has_a_specific_actionable_error() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"");
     let value: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(value["error"]["code"], "invalid_configuration");
     assert!(
@@ -299,7 +299,7 @@ fn invalid_configuration_has_a_specific_actionable_error() {
 fn add_missing_path_identifies_the_field_and_exact_usage() {
     let output = duckdoor().args(["add", "music"]).output().unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"");
     let value: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(value["error"]["code"], "invalid_arguments");
     assert!(value["error"]["message"].as_str().unwrap().contains("<PATH>"));
@@ -325,7 +325,7 @@ fn duplicate_backend_name_is_reported_before_path_validation() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"");
     let value: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(value["error"]["code"], "backend_already_exists");
     assert_eq!(value["error"]["details"]["existing"]["name"], "music");
@@ -354,7 +354,7 @@ fn remove_all_is_atomic_idempotent_and_preserves_source_files() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr, b"");
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["data"]["scope"], "all");
     assert_eq!(value["data"]["changed"], true);
@@ -426,7 +426,7 @@ fn remove_requires_exactly_one_name_or_all() {
     for arguments in [vec!["remove"], vec!["remove", "app", "--all"]] {
         let output = duckdoor().args(arguments).output().unwrap();
         assert_eq!(output.status.code(), Some(2));
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout, b"");
         let value: Value = serde_json::from_slice(&output.stderr).unwrap();
         assert_eq!(value["error"]["code"], "invalid_arguments");
         assert!(value["error"]["details"]["help"].is_string());
@@ -452,7 +452,7 @@ fn logical_view_commands_are_structured_and_persistent() {
         .output()
         .unwrap();
     assert!(added.status.success());
-    assert!(added.stderr.is_empty());
+    assert_eq!(added.stderr, b"");
     let value: Value = serde_json::from_slice(&added.stdout).unwrap();
     assert_eq!(value["command"], "view.add");
     assert_eq!(value["data"]["resolution"]["status"], "unavailable");
@@ -497,7 +497,7 @@ fn strict_missing_view_source_fails_without_saving_configuration() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"");
     let value: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(value["error"]["code"], "configuration_validation_failed");
     assert_eq!(value["error"]["details"]["configuration_changed"], false);

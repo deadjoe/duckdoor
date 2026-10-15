@@ -18,7 +18,7 @@ For the process model, query path, worker-pool design, reload semantics, data-vi
 
 ## Install
 
-You need Rust 1.85.1 or newer and a C++ toolchain.
+You need Rust 1.89 or newer and a C++ toolchain.
 
 ```sh
 cargo install --path . --locked
