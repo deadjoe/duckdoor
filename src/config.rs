@@ -416,7 +416,7 @@ mod tests {
         let config = load_config(&paths).unwrap();
         assert_eq!(config.version, 1);
         assert_eq!(config.listen, DEFAULT_LISTEN);
-        assert!(config.views.is_empty());
+        assert_eq!(config.views, []);
         assert!(paths.admin_token.exists());
     }
 
