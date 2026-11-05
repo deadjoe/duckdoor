@@ -30,10 +30,14 @@ jobs:
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --all-features --locked
       - run: cargo build --release --locked
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
       - name: Verify upgrade from DuckDB 1.5.6
+        timeout-minutes: 10
         run: |
           python3 -m venv "$RUNNER_TEMP/duckdoor-upgrade-venv"
-          "$RUNNER_TEMP/duckdoor-upgrade-venv/bin/python" -m pip install duckdb==1.5.6
+          "$RUNNER_TEMP/duckdoor-upgrade-venv/bin/python" -m pip install --only-binary=:all: duckdb==1.5.6
           "$RUNNER_TEMP/duckdoor-upgrade-venv/bin/python" scripts/verify_upgrade.py target/release/duckdoor
 
   dependency-review:
