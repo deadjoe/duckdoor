@@ -873,6 +873,123 @@ mod tests {
     use crate::config::ViewInput;
 
     #[test]
+    fn bundled_engine_reports_release_version() {
+        let connection = Connection::open_in_memory().unwrap();
+        let version: String = connection
+            .query_row("SELECT version()", [], |row| row.get(0))
+            .unwrap();
+        // Development version labels make INSTALL request extensions by commit hash.
+        // Update this assertion when deliberately upgrading the embedded engine.
+        assert_eq!(version, "v2.0.0");
+    }
+
+    #[test]
+    fn sqlite_extension_installs_into_empty_cache_and_loads_without_installation() {
+        let cache = tempfile::tempdir().unwrap();
+        let configure_cache = format!(
+            "SET extension_directory = '{}'",
+            escape_literal(&cache.path().to_string_lossy())
+        );
+        let installer = Connection::open_in_memory().unwrap();
+        installer.execute_batch(&configure_cache).unwrap();
+        load_sqlite_extension(&installer, true).unwrap();
+        drop(installer);
+
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(&configure_cache).unwrap();
+        // A fresh connection must load the installed, signed extension without INSTALL.
+        connection
+            .execute_batch("SET autoinstall_known_extensions = false; SET autoload_known_extensions = false;")
+            .unwrap();
+        load_sqlite_extension(&connection, false).unwrap();
+        let loaded: bool = connection
+            .query_row(
+                "SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'sqlite_scanner'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(loaded);
+    }
+
+    #[test]
+    fn parquet_queries_work_without_extension_downloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("events.parquet");
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(&format!(
+                "SET extension_directory = '{}'; \
+                 SET autoinstall_known_extensions = false; \
+                 SET autoload_known_extensions = false; \
+                 COPY (SELECT 42::INTEGER AS id) TO '{}' (FORMAT PARQUET)",
+                escape_literal(&directory.path().join("extensions").to_string_lossy()),
+                escape_literal(&file.to_string_lossy()),
+            ))
+            .unwrap();
+        let result = run_query(
+            &connection,
+            &format!(
+                "SELECT id FROM read_parquet('{}')",
+                escape_literal(&file.to_string_lossy())
+            ),
+            10,
+        )
+        .unwrap();
+        assert_eq!(result.rows, vec![vec![json!(42)]]);
+        assert!(!directory.path().join("extensions").exists());
+    }
+
+    #[test]
+    fn upgraded_engine_preserves_query_values_and_row_limits() {
+        let connection = Connection::open_in_memory().unwrap();
+        let result = run_query(
+            &connection,
+            "SELECT NULL AS empty, true AS flag, 170141183460469231731687303715884105727::HUGEINT AS huge, \
+             12.34::DECIMAL(10, 2) AS amount, '\\x00\\xFF'::BLOB AS bytes, \
+             [1, NULL, 3] AS items, {'name': 'duck', 'id': 7} AS record",
+            10,
+        )
+        .unwrap();
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result.columns.len(), 7);
+        assert_eq!(result.columns[3].name, "amount");
+        assert_eq!(
+            result.rows[0],
+            vec![
+                JsonValue::Null,
+                json!(true),
+                json!("170141183460469231731687303715884105727"),
+                json!("12.34"),
+                json!("AP8="),
+                json!([1, null, 3]),
+                json!({"name": "duck", "id": 7}),
+            ]
+        );
+        let capped = run_query(&connection, "SELECT i FROM range(3) t(i) ORDER BY i", 2).unwrap();
+        assert_eq!(capped.rows, vec![vec![json!(0)], vec![json!(1)]]);
+        assert!(capped.truncated);
+        let empty = run_query(&connection, "SELECT 1 AS id WHERE false", 2).unwrap();
+        assert_eq!(empty.rows, Vec::<Vec<JsonValue>>::new());
+        assert_eq!(empty.columns[0].name, "id");
+        assert!(!empty.truncated);
+        let nulls = run_query(
+            &connection,
+            "SELECT [NULL] AS list, {'empty': NULL} AS record, map(['key'], [NULL]) AS mapping",
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            nulls.rows[0],
+            vec![
+                json!([null]),
+                json!({"empty": null}),
+                json!([{"key": "key", "value": null}])
+            ]
+        );
+    }
+
+    #[test]
     fn pool_queries_sqlite_read_only() {
         let dir = tempfile::tempdir().unwrap();
         let sqlite_path = dir.path().join("app.sqlite");
@@ -1049,6 +1166,11 @@ mod tests {
             }],
             ..Config::default()
         };
+        let original_sources: Vec<_> = config
+            .backends
+            .iter()
+            .map(|backend| (backend.path.clone(), fs::read(&backend.path).unwrap()))
+            .collect();
         let pool = QueryPool::new(&config, "").unwrap();
         assert_eq!(pool.stats().active_views, 1);
         assert!(pool.allowed_relations.contains("archive.parquet"));
@@ -1078,6 +1200,14 @@ mod tests {
             result.rows[2],
             vec![json!("archive"), json!("C"), json!("archive"), json!(2019)]
         );
+        for (path, original) in original_sources {
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                original,
+                "source changed: {}",
+                path.display()
+            );
+        }
     }
 
     #[test]

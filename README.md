@@ -24,7 +24,7 @@ You need Rust 1.89 or newer and a C++ toolchain.
 cargo install --path . --locked
 ```
 
-The executable contains DuckDB itself. On the first SQLite registration, DuckDB downloads its signed official `sqlite` extension into the user's DuckDB extension cache. Later starts load the cached extension; production images should warm that cache during provisioning if runtime network access is unavailable. Native DuckDB and Parquet sources do not need that SQLite extension.
+The executable contains DuckDB 2.0.0 and its Parquet support. On the first SQLite registration, DuckDB downloads its signed official `sqlite` extension into the user's DuckDB extension cache. Later starts load the cached extension; production images should warm that cache during provisioning if runtime network access is unavailable. Extension caches are specific to the engine version, so upgrading from DuckDB 1.5 requires a fresh SQLite extension download. Native DuckDB and Parquet sources do not need extension downloads.
 
 `duckdoor` currently targets macOS and Linux. By default its files live in the platform configuration directory. Set `DUCKDOOR_HOME` or pass `--home` to use another directory.
 
@@ -241,10 +241,23 @@ Use `duckdoor query` for shell scripts, or call `/v1/query` from Python or any H
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-features --locked
 cargo build --release --locked
+cargo deny check
 ```
+
+The tests include installation of the official SQLite extension into an empty temporary cache, so the test suite needs access to `extensions.duckdb.org`. They also check that Parquet works with extension installation and autoloading disabled.
+
+CI additionally runs `scripts/verify_upgrade.py` against the release binary on Linux and macOS. It requires the Python package `duckdb==1.5.6` in an isolated environment, creates synthetic old-format data, and verifies CLI/HTTP queries, views, reload/restart, and unchanged source checksums. To reproduce with uv:
+
+```sh
+uv run --no-project --with duckdb==1.5.6 python scripts/verify_upgrade.py target/release/duckdoor
+```
+
+DuckDB is reviewed separately from other Dependabot updates. Its Rust crate encodes the engine version in the middle component (`1.20000.x` means DuckDB 2.0.0); the tilde requirement accepts binding fixes without silently changing the engine during a lockfile refresh. Keep the release-version regression test in sync when upgrading engines. Use `1.20000.1` or later in this series: `1.20000.0` mislabeled bundled builds as development versions and requested unavailable SQLite extensions.
+
+The Rust binding currently has a small [local compatibility patch](vendor/README.md) for scalar and nested SQL `NULL` values. Retain its regression tests when replacing it with a fixed upstream release.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
