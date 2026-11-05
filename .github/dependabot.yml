@@ -5,8 +5,11 @@ updates:
     schedule:
       interval: weekly
     groups:
+      duckdb:
+        patterns: ["duckdb", "libduckdb-sys"]
       rust-dependencies:
         patterns: ["*"]
+        exclude-patterns: ["duckdb", "libduckdb-sys"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
