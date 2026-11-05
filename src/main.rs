@@ -1183,15 +1183,23 @@ fn doctor(paths: &Paths) -> Result<()> {
             json!({ "cause": format!("{error:#}"), "probe_workers": 1 }),
         )
     })?;
-    tokio::runtime::Runtime::new()?
-        .block_on(pool.query("SELECT 42 AS answer".to_owned()))
+    let probe_sql = "SELECT 42 AS answer, version() AS duckdb_version";
+    let probe = tokio::runtime::Runtime::new()?
+        .block_on(pool.query(probe_sql.to_owned()))
         .map_err(|error| {
             output::CommandError::new(
                 "doctor_query_failed",
                 "query engine probe failed",
-                json!({ "cause": format!("{error:#}"), "sql": "SELECT 42 AS answer" }),
+                json!({ "cause": format!("{error:#}"), "sql": probe_sql }),
             )
         })?;
+    let engine_version = probe
+        .rows
+        .first()
+        .and_then(|row| row.get(1))
+        .and_then(serde_json::Value::as_str)
+        .context("engine probe did not return a DuckDB version")?
+        .trim_start_matches('v');
     if let Some(pid) = daemon::running_pid(paths)? {
         daemon::health(paths).with_context(|| format!("daemon pid {pid} is unhealthy"))?;
     }
@@ -1206,17 +1214,11 @@ fn doctor(paths: &Paths) -> Result<()> {
             "views": views,
             "engine": {
                 "status": "ok",
-                "duckdb_version": duckdb_version(),
+                "duckdb_version": engine_version,
                 "probe_workers": 1,
             },
             "daemon": daemon::status(paths)?,
             "warnings": warnings,
         }),
     )
-}
-
-fn duckdb_version() -> &'static str {
-    // duckdb-rs and DuckDB use aligned release numbering; the exact engine
-    // version is also visible through SELECT version().
-    "1.5.5"
 }

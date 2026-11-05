@@ -98,6 +98,29 @@ fn finite_commands_emit_one_json_document() {
 }
 
 #[test]
+fn doctor_reports_the_running_engine_version() {
+    let home = tempfile::tempdir().unwrap();
+    let output = duckdoor()
+        .arg("--home")
+        .arg(home.path())
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let actual = Connection::open_in_memory().unwrap().version().unwrap();
+    assert_eq!(
+        response["data"]["engine"]["duckdb_version"],
+        actual.trim_start_matches('v')
+    );
+    assert_eq!(response["data"]["status"], "ok");
+}
+
+#[test]
 fn add_infers_and_validates_duckdb_and_parquet_sources() {
     let home = tempfile::tempdir().unwrap();
     initialize_home(home.path());
